@@ -1,56 +1,124 @@
 import time
-
 import pandas as pd
-import numpy as np
 import xgboost as xgb
+import matplotlib.pyplot as plt
+from xgboost import plot_importance 
 
-from sklearn.cross_validation import train_test_split
+path = './project_practice/talkingdata/'
 
-path = './input/'
-
-
-def dataPreProcessTime(df):
-    df['click_time'] = pd.to_datetime(df['click_time']).dt.date
-    df['click_time'] = df['click_time'].apply(lambda x: x.strftime('%Y%m%d')).astype(int)
+##convert time variables
+def create_time(df):
+    df['click_time'] = pd.to_datetime(df['click_time'])
+    df['day'] = df.click_time.dt.day
+    df['hour'] = df.click_time.dt.hour
     return df
 
+##create # of click
+def comb_click(df, features=[]):
+    for i in features:
+        if 'click_{}'.format(i) in df.columns:
+            print('You had already created the new feaure click_{}.'.format(i))
+        
+        else:        
+            df['click'] = 1
+            tmp = df[['{}'.format(i), 'hour', 'day', 'click']].groupby(['{}'.format(i), 'hour', 'day']).sum().sort_values(by='click', ascending=False)
+            tmp.reset_index(inplace=True)
+            tmp = tmp.rename(columns={'click': 'click_{}'.format(i)})
+            df = pd.merge(df, tmp, on=['{}'.format(i), 'hour', 'day'])
+            print('New features click_{} had been created.'.format(i))
+            
+    return df
+
+##drop features which are unnecessary for model
+def drop_features(df, features=[]):
+    return df.drop(features, axis=1)
+
+
+#Model: xgboost
+##import train and test 
+dtypes = {
+        'ip'            : 'uint32',
+        'app'           : 'uint16',
+        'device'        : 'uint16',
+        'os'            : 'uint16',
+        'channel'       : 'uint16',
+        'is_attributed' : 'uint8',
+        'click_id'      : 'uint32'
+        }
+
 start_time = time.time()
+df_train = pd.read_csv(path+'train.csv', skiprows=range(1,122903891), 
+                       nrows=62000000, usecols=['ip', 'app', 'device', 'os', 'channel', 'click_time', 'is_attributed'],
+                       dtype=dtypes)
+df_test = pd.read_csv(path+'test.csv', usecols=['ip', 'app', 'device', 'os', 'channel', 'click_time', 'click_id'],
+                      dtype=dtypes)
+print('It takes {:.2f} seconds for importing two dataset.'.format(time.time()-start_time))
 
-train = pd.read_csv(path+"train.csv", nrows=20000000)
-test = pd.read_csv(path+"test.csv")
+##create time feature
+start_time = time.time()
+df_train = create_time(df_train)
+df_test = create_time(df_test)
+print('It takes {:.2f} seconds for convert string to datetime.'.format(time.time()-start_time))
 
-print('[{}] Finished to load data'.format(time.time() - start_time))
+#create combination freature
+start_time = time.time()
+df_train = comb_click(df_train, features=['ip'])
+df_test = comb_click(df_test, features=['ip'])
+print('It takes {:.2f} seconds for creating new features.'.format(time.time()-start_time))
 
-train = dataPreProcessTime(train)
-test = dataPreProcessTime(test)
+##drop features to save spaces
+start_time = time.time()
+df_train = drop_features(df_train, features=['ip', 'click_time', 'day', 'click'])
+df_test = drop_features(df_test, features=['ip', 'click_time', 'day', 'click'])
+print('It takes {:.2f} seconds for dropping features.'.format(time.time()-start_time))
 
-y = train['is_attributed']
-train.drop(['is_attributed', 'attributed_time'], axis=1, inplace=True)
+##Training and test in df_train
+y = df_train['is_attributed']
+df_train = df_train.drop(['is_attributed'], axis=1)
+X = df_train
+del df_train
 
-sub = pd.DataFrame()
-sub['click_id'] = test['click_id']
-test.drop('click_id', axis=1, inplace=True)
+from sklearn.model_selection import train_test_split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1, random_state=1)
+del X
+del y
 
-print('[{}] Start XGBoost Training'.format(time.time() - start_time))
+##Test
+submit = pd.DataFrame()
+submit['click_id'] = df_test['click_id'].values
+df_test = df_test.drop(['click_id'], axis=1)
 
-params = {'eta': 0.1, 
-          'max_depth': 4, 
-          'subsample': 0.9, 
-          'colsample_bytree': 0.7, 
-          'colsample_bylevel':0.7,
-          'min_child_weight':100,
-          'alpha':4,
-          'objective': 'binary:logistic', 
-          'eval_metric': 'auc', 
-          'random_state': 99, 
-          'silent': True}
+print('Start to run the model...')
+##Model
+params = {'silent': True,                   #It’s generally good to keep it 0 as the messages might help in understanding the model.
+          'nthread': 8,                     #Core for using
+          'eta': 0.3,                       #Analogous to learning rate in GBM
+          'min_child_weight':0,             #Control overfitting.
+          'max_depth': 0,                   #0 means no limit, typical values: 3-10
+          'max_leaves': 1400,               #Maximum number of nodes to be added. (for lossguide grow policy)
+          'subsample': 0.9,
+          'colsample_bytree': 0.7,
+          'colsample_bylevel': 0.7,
+          'alpha': 4,                       #L1 regularization on weights | default=0 | large value == more conservative model
+          'scale_pos_weight': 9,            #Bbecause training data is extremely unbalanced: used 1 in the first and second submittion. 
+          'objective': 'binary:logistic',   #logistic regression for binary classification, output probability
+          'eval_metric': 'auc',
+          'tree_method': "hist",            #Fast histogram optimized approximate greedy algorithm. 
+          'grow_policy': "lossguide",       #split at nodes with highest loss change
+          'random_state': 1}
           
-x1, x2, y1, y2 = train_test_split(train, y, test_size=0.3, random_state=99)
+          
+watchlist = [(xgb.DMatrix(X_train, y_train), 'train'), (xgb.DMatrix(X_test, y_test), 'valid')]
 
-watchlist = [(xgb.DMatrix(x1, y1), 'train'), (xgb.DMatrix(x2, y2), 'valid')]
-model = xgb.train(params, xgb.DMatrix(x1, y1), 250, watchlist, maximize=True, verbose_eval=10)
+start_time = time.time()
+bst = xgb.train(params, xgb.DMatrix(X_train, y_train), 50, watchlist, early_stopping_rounds = 20, verbose_eval=1)
+print('[{:.2f} seconds]: Training time for Histogram Optimized XGBoost model.'.format(time.time() - start_time))
+del X_train, X_test, y_train, y_test
 
-print('[{}] Finish XGBoost Training'.format(time.time() - start_time))
+print('Start the prediction...')
+submit['is_attributed'] = bst.predict(xgb.DMatrix(df_test), ntree_limit=bst.best_ntree_limit)
+submit = submit.sort_values(by='click_id')
+print('finish the prediction...')
 
-sub['is_attributed'] = model.predict(xgb.DMatrix(test), ntree_limit=model.best_ntree_limit)
-sub.to_csv('xgb_sub.csv',index=False)
+print('Save the prediction to csv')
+submit.to_csv(path+'xgboost3.csv', index=False)
